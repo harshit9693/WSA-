@@ -1,0 +1,9 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.7
+transformers==4.37.2
+torch==2.2.0
+numpy==1.26.3
+pandas==2.1.4
+emoji==2.9.0
+urllib3==2.1.0
