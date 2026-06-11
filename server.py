@@ -4,11 +4,14 @@ ChatInsights - WhatsApp Chat Analyzer Backend
 ============================================
 Run with: python server.py
 
+Supports both .txt and .zip exports from WhatsApp.
 Server starts INSTANTLY. Sentiment model loads in the background.
 """
 
 import re
 import os
+import io
+import zipfile
 import logging
 import threading
 from collections import Counter, defaultdict
@@ -44,11 +47,40 @@ def _load_model_background():
     except Exception as e:
         logger.warning(f"Sentiment model failed to load: {e}. Using rule-based fallback.")
         _sentiment_pipeline = None
-        _model_ready = True  # mark ready so analysis doesn't wait forever
+        _model_ready = True
     _model_loading = False
 
 def get_sentiment_pipeline():
-    return _sentiment_pipeline  # always returns immediately (None = use fallback)
+    return _sentiment_pipeline
+
+
+# ─── ZIP extraction helper ────────────────────────────────────────────────────
+
+def extract_txt_from_zip(zip_bytes: bytes) -> tuple[str, str]:
+    """
+    Extract the WhatsApp chat .txt from a zip archive.
+    Returns (text_content, filename).
+    Raises ValueError if no suitable .txt file is found.
+    """
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        txt_files = [
+            name for name in zf.namelist()
+            if name.endswith('.txt') and not name.startswith('__MACOSX')
+        ]
+        if not txt_files:
+            raise ValueError(
+                "No .txt file found inside the ZIP. "
+                "Make sure you uploaded a WhatsApp export ZIP."
+            )
+        # Prefer the largest .txt (most likely the chat, not a readme)
+        txt_name = max(txt_files, key=lambda n: zf.getinfo(n).file_size)
+        raw = zf.read(txt_name)
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            text = raw.decode('latin-1')
+        logger.info(f"Extracted '{txt_name}' from ZIP ({len(text)} chars)")
+        return text, txt_name
 
 
 # ─── WhatsApp Chat Parser ─────────────────────────────────────────────────────
@@ -218,7 +250,6 @@ def analyse_chat(messages):
     most_active_day = max(daily, key=daily.get) if daily else ''
     best_hour = max(hourly, key=hourly.get) if hourly else 0
 
-    # Per-participant
     participant_stats, participant_sentiments_list = [], []
     sender_texts = defaultdict(list)
     for m in messages:
@@ -309,13 +340,12 @@ def analyse_chat(messages):
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 
-app = FastAPI(title='ChatInsights API', version='1.0.0')
+app = FastAPI(title='ChatInsights API', version='2.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
 
 @app.on_event('startup')
 def startup_event():
-    """Start model loading in background — server is immediately ready."""
     t = threading.Thread(target=_load_model_background, daemon=True)
     t.start()
 
@@ -336,34 +366,62 @@ def info():
         'sentiment_model': 'distilbert-base-uncased-finetuned-sst-2-english' if _sentiment_pipeline else 'rule-based fallback',
         'model_loaded': _sentiment_pipeline is not None,
         'model_loading': _model_loading,
+        'supported_formats': ['.txt', '.zip'],
     }
 
 
 @app.post('/analyze')
 async def analyze(file: UploadFile = File(...)):
-    if not file.filename.endswith('.txt'):
-        raise HTTPException(status_code=400, detail='Only .txt files are supported')
+    filename = file.filename or ''
+    is_zip = filename.lower().endswith('.zip')
+    is_txt = filename.lower().endswith('.txt')
+
+    if not is_zip and not is_txt:
+        raise HTTPException(
+            status_code=400,
+            detail='Only .txt or .zip files are supported. '
+                   'Export your WhatsApp chat and upload either format.'
+        )
 
     content = await file.read()
-    try:
-        text = content.decode('utf-8')
-    except UnicodeDecodeError:
-        text = content.decode('latin-1')
+    extracted_name = filename
 
-    logger.info(f'Received: {file.filename} ({len(text)} chars)')
+    # ── Handle ZIP: extract the .txt inside ──────────────────────────────────
+    if is_zip:
+        try:
+            text, extracted_name = extract_txt_from_zip(content)
+        except zipfile.BadZipFile:
+            return {
+                'success': False,
+                'error': 'The uploaded file is not a valid ZIP archive.',
+            }
+        except ValueError as e:
+            return {'success': False, 'error': str(e)}
+    else:
+        try:
+            text = content.decode('utf-8')
+        except UnicodeDecodeError:
+            text = content.decode('latin-1')
+
+    logger.info(f'Received: {filename} → parsing "{extracted_name}" ({len(text)} chars)')
 
     messages = parse_whatsapp_chat(text)
     if not messages:
         return {
             'success': False,
-            'error': 'Could not parse any messages. Make sure this is a WhatsApp exported .txt file.',
+            'error': (
+                'Could not parse any messages.\n\n'
+                'Make sure this is a WhatsApp exported chat file.\n'
+                'On Android: Chat → ⋮ → More → Export Chat → Without Media\n'
+                'On iPhone: Chat → Contact/Group name → Export Chat'
+            ),
         }
 
     logger.info(f'Parsed {len(messages)} messages from {len(set(m["sender"] for m in messages))} senders')
 
     try:
         data = analyse_chat(messages)
-        return {'success': True, 'data': data}
+        return {'success': True, 'data': data, 'source_file': extracted_name}
     except Exception as e:
         logger.exception('Analysis error')
         return {'success': False, 'error': str(e)}
@@ -371,13 +429,13 @@ async def analyze(file: UploadFile = File(...)):
 
 if __name__ == '__main__':
     print('=' * 55)
-    print('  ChatInsights — WhatsApp Analyzer Backend')
+    print('  ChatInsights — WhatsApp Analyzer Backend v2')
     print('=' * 55)
     print('  Server : http://localhost:8080')
     print('  Status : http://localhost:8080/health')
     print('  Docs   : http://localhost:8080/docs')
     print()
-    print('  Server starts instantly.')
+    print('  Accepts: .txt and .zip WhatsApp exports')
     print('  Sentiment model loads in the background.')
     print('  Ctrl+C to stop.')
     print('=' * 55)
